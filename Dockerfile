@@ -1,25 +1,37 @@
-# Use a lightweight, secure Python base image
-FROM python:3.11-slim
+# ─── STEP 1: BASE PYTHON ENVIRONMENT ───
+FROM python:3.12-slim AS base
 
-# Install system dependencies required for handling code diffs
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    patch \
-    && rm -rf /var/lib/apt/lists/*
+# Prevent Python from writing .pyc files and force unbuffered logging
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV DEBIAN_FRONTEND=noninteractive
 
-# Set secure working directory
 WORKDIR /app
 
-# Copy and install Python dependencies
+# ─── STEP 2: INSTALL SYSTEM DEPENDENCIES & TRIVY ───
+# ─── STEP 2: INSTALL SYSTEM DEPENDENCIES & TRIVY ───
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    curl \
+    ca-certificates \
+    apt-transport-https \
+    gnupg \
+    && curl -sfL https://get.trivy.dev/deb/public.key | gpg --dearmor -o /usr/share/keyrings/trivy.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://get.trivy.dev/deb generic main" | tee /etc/apt/sources.list.d/trivy.list \
+    && apt-get update && apt-get install -y --no-install-recommends trivy \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# ─── STEP 3: INSTALL PYTHON DEPENDENCIES ───
+# Copy requirements first to leverage Docker build caching optimization
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application source code
-COPY sandbox_runner.py .
-COPY agent_llm.py .
-COPY remediation_graph.py .
-COPY main.py .
-# We will create provenance.py next
-COPY provenance.py . 
+# ─── STEP 4: COPIES APP SOURCE ASSETS ───
+COPY . .
 
-# Change the final line of your existing Dockerfile from main.py to app.py
-CMD ["python", "app.py"]
+# Expose FastAPI's production engine port
+EXPOSE 8080
+
+# Run Uvicorn directly inside the container layout environment context
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]

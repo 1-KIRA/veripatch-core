@@ -3,12 +3,13 @@ import sys
 from typing import TypedDict, Literal
 from langgraph.graph import StateGraph, START, END
 
-# Import our updated production helper modules
+# Import updated production helper modules
 from sandbox_runner import SandboxValidationRunner
 from agent_llm import PatchGenerationEngine
 from provenance import ProvenanceSigner
 from git_provider import GitExecutionProvider
 
+# 1. Enhanced State Schema to preserve baseline content tracking
 class RemediationState(TypedDict):
     cve_id: str
     vulnerability_details: str
@@ -21,6 +22,7 @@ class RemediationState(TypedDict):
     max_iterations: int
     human_approved: bool
     patched_code: str
+    original_code: str  # ✨ Added to pass down the real file baseline cleanly
 
 class VeriPatchEngine:
     def __init__(self, max_loops: int = 3):
@@ -30,7 +32,8 @@ class VeriPatchEngine:
         self.signer = ProvenanceSigner()
         self.git_provider = GitExecutionProvider()
         
-        self.target_source_code = (
+        # Local development fallback context canvas
+        self.fallback_source_code = (
             "import random\n\n"
             "def generate_session_token():\n"
             "    import random\n"
@@ -40,9 +43,11 @@ class VeriPatchEngine:
 
     def triage_node(self, state: RemediationState) -> dict:
         print(f"\n[TRIAGE AGENT] Mapping exploit signatures for target: {state['cve_id']}\n" + "-"*50)
+        
+        # 🔄 DYNAMIC SEEDING: Keep the incoming parameters passed from the ingestion router
         return {
-            "vulnerable_file": "src/auth/session.py",
-            "vulnerability_details": "CWE-330: Use of Insufficiently Random Values. Source code relies on the standard pseudo-random 'random' module instead of cryptographically secure modules.",
+            "vulnerable_file": state.get("vulnerable_file") or "src/auth/session.py",
+            "vulnerability_details": state.get("vulnerability_details") or "CWE-330: Use of Insufficiently Random Values.",
             "iteration_count": 0,
             "verification_status": "PENDING"
         }
@@ -51,32 +56,38 @@ class VeriPatchEngine:
         current_attempt = state.get("iteration_count", 0) + 1
         previous_fail_logs = state.get("verification_logs", None) if state.get("verification_status") == "FAILED" else None
         
-        # Requests full file content from the LLM
+        # Use live file text passed from workspace, or drop back to development canvas if empty
+        active_baseline = state.get("original_code") or state.get("patched_code") or self.fallback_source_code
+        
+        # Requests full context-aware remediation from the LLM client engine
         full_file_code = self.llm_engine.generate_patch(
             cve_id=state["cve_id"],
             file_path=state["vulnerable_file"],
-            file_content=self.target_source_code,
+            file_content=active_baseline,
             vulnerability_details=state["vulnerability_details"],
             previous_error=previous_fail_logs
         )
         
-        print(f"[REMEDIATION AGENT] Attempt {current_attempt} -> Complete source file generated.")
+        print(f"[REMEDIATION AGENT] Attempt {current_attempt} -> Complete source file text context generated.")
         return {
             "patched_code": full_file_code,
             "iteration_count": current_attempt
         }
 
     def verify_node(self, state: RemediationState) -> dict:
-        print(f"[VERIFICATION AGENT] Executing syntax validation on proposed code...")
+        print(f"[VERIFICATION AGENT] Executing syntax validation checks on proposed solution...")
         
+        active_baseline = state.get("original_code") or self.fallback_source_code
+        
+        # Evaluate syntax integrity and build programmatic diff layouts inside the runner execution profile
         run_results = self.sandbox.run_sandbox_pipeline(
-            original_code=self.target_source_code,
+            original_code=active_baseline,
             proposed_code=state["patched_code"],
             file_path=state["vulnerable_file"]
         )
         
         if run_results["success"]:
-            print(f"[VERIFICATION SUCCESS] Code compiled safely. Flawless diff programmatically generated.")
+            print(f"[VERIFICATION SUCCESS] Code compiled safely. Flawless patch diff programmatically generated.")
             return {
                 "verification_status": "PASSED",
                 "verification_logs": run_results["logs"],
@@ -116,7 +127,7 @@ class VeriPatchEngine:
 
 if __name__ == "__main__":
     if not os.getenv("OPENROUTER_API_KEY") and not os.getenv("OPENAI_API_KEY"):
-        print("[CRITICAL] Missing access keys. Please export your environment key token:\n")
+        print("[CRITICAL] Missing access keys. Please export your environment key token.\n")
         sys.exit(1)
 
     engine = VeriPatchEngine(max_loops=3)
@@ -133,105 +144,9 @@ if __name__ == "__main__":
         "current_patch_diff": "",
         "verification_logs": "",
         "iteration_count": 0,
-        "patched_code": ""
+        "patched_code": "",
+        "original_code": ""
     }
     
     final_state = graph.invoke(execution_payload)
-    
-    if final_state["verification_status"] == "PASSED":
-        print("\n" + "="*60 + "\n[PRODUCTION DELIVERY] Generating Provenance Manifest...")
-        
-        signed_receipt = engine.signer.generate_verified_manifest(
-            cve_id=final_state["cve_id"],
-            repo=final_state["repository_path"],
-            patch_diff=final_state["current_patch_diff"],
-            log_summary=final_state["verification_logs"]
-        )
-        
-        git_package = engine.git_provider.create_remediation_branch(
-            repo_name="auth-layer-production",
-            cve_id=final_state["cve_id"],
-            target_file=final_state["vulnerable_file"],
-            patched_code=final_state.get("patched_code", ""),
-            signed_manifest=signed_receipt
-        )
-        
-        print("\n" + "#"*60 + "\nFINAL PULL REQUEST LOG READY FOR ENTERPRISE REVIEW:")
-        print("#"*60)
-        print(git_package["pull_request_markdown"])
-        print("#"*60)
-
-# Locate this block at the very bottom of your main.py file
-    if final_state["verification_status"] == "PASSED":
-        print("\n" + "="*60 + "\n[PRODUCTION DELIVERY] Generating Provenance Manifest...")
-        
-        signed_receipt = engine.signer.generate_verified_manifest(
-            cve_id=final_state["cve_id"],
-            repo=final_state["repository_path"],
-            patch_diff=final_state["current_patch_diff"],
-            log_summary=final_state["verification_logs"]
-        )
-        
-        # 1. Create local tracking branch structure
-        git_package = engine.git_provider.create_remediation_branch(
-            repo_name="auth-layer-production", # Replace with your target repository name
-            cve_id=final_state["cve_id"],
-            target_file=final_state["vulnerable_file"],
-            patched_code=final_state.get("patched_code", ""),
-            signed_manifest=signed_receipt
-        )
-        
-        # 2. TRIGGER THE LIVE GITHUB PUSH
-        pr_transaction = engine.git_provider.push_and_open_pr(
-            repo_name="auth-layer-production", # Must match a real repo in your GitHub profile
-            branch_name=git_package["target_branch"],
-            pr_title=f"⏳ [VeriPatch] Security Remediation for {final_state['cve_id']}",
-            pr_body=git_package["pull_request_markdown"]
-        )
-        
-        if pr_transaction["success"]:
-            print(f"\n🚀 [SUCCESS] Live enterprise security PR successfully opened at:\n{pr_transaction['url']}\n")
-        else:
-            print("\n" + "#"*60 + "\nLOCAL PR LOG SNAPSHOT (Upstream Auth Omitted):")
-            print("#"*60)
-            print(git_package["pull_request_markdown"])
-            print("#"*60)
-
-# ... (Keep everything above identical)
-    final_state = graph.invoke(execution_payload)
-    
-    if final_state["verification_status"] == "PASSED":
-        print("\n" + "="*60 + "\n[PRODUCTION DELIVERY] Generating Provenance Manifest...")
-        
-        signed_receipt = engine.signer.generate_verified_manifest(
-            cve_id=final_state["cve_id"],
-            repo=final_state["repository_path"],
-            patch_diff=final_state["current_patch_diff"],
-            log_summary=final_state["verification_logs"]
-        )
-        
-        git_package = engine.git_provider.create_remediation_branch(
-            repo_name="auth-layer-production",
-            cve_id=final_state["cve_id"],
-            target_file=final_state["vulnerable_file"],
-            patched_code=final_state.get("patched_code", ""),
-            signed_manifest=signed_receipt
-        )
-        
-        # --- NEW: UPDATE DATABASE LEDGER IMMEDIATELY ---
-        from audit_logger import EnterpriseAuditLogger
-        db_logger = EnterpriseAuditLogger()
-        db_logger.log_remediation_event(
-            cve_id=final_state["cve_id"],
-            target_file=final_state["vulnerable_file"],
-            sandbox_status=final_state["verification_status"],
-            patch_sha256=signed_receipt["manifest"]["patch_sha256"],
-            kms_signature=signed_receipt["cryptographic_signature"],
-            pr_url="Omitted (Local Dev Simulation Mode)",
-            log_summary=final_state["verification_logs"]
-        )
-        print("[AUDIT COMPLIANCE] Successfully committed signature to database ledger.")
-        # -----------------------------------------------
-        
-        print("\n" + "#"*60 + "\nFINAL PULL REQUEST LOG READY FOR ENTERPRISE REVIEW:")
-        print(git_package["pull_request_markdown"])
+    print(f"\nExecution terminated with Status: {final_state['verification_status']}")

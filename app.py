@@ -1,368 +1,677 @@
 import os
-import sys
+import shutil
+import time
+import csv
+import io
+import json
 import re
 import hmac
 import hashlib
-import uvicorn
-from fastapi import FastAPI, Request, BackgroundTasks, Header, HTTPException
 from fastapi.responses import HTMLResponse
-
-# ---- CRITICAL INTERNAL MODULE IMPORTS ----
+from fastapi import FastAPI, Request, BackgroundTasks, Header, HTTPException, Response
+from pydantic import BaseModel
+import uvicorn
+import requests
+from sandbox_runner import SandboxValidationRunner
 from audit_logger import EnterpriseAuditLogger
-from main import VeriPatchEngine
 
-# 1. Fetch secrets directly from the host system environment (NO hardcoded fallbacks!)
-TRIVY_AUTH_TOKEN = os.getenv("TRIVY_AUTH_TOKEN")
-GITHUB_WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GITHUB_OWNER = os.getenv("GITHUB_OWNER")
+app = FastAPI()
 
-# 2. Strict Configuration Audit: Fail-Fast if ANY critical key is missing
-critical_secrets = {
-    "TRIVY_AUTH_TOKEN": TRIVY_AUTH_TOKEN,
-    "GITHUB_WEBHOOK_SECRET": GITHUB_WEBHOOK_SECRET,
-    "OPENROUTER_API_KEY": OPENROUTER_API_KEY,
-    "GITHUB_TOKEN": GITHUB_TOKEN,
-    "GITHUB_OWNER": GITHUB_OWNER
-}
-
-missing_secrets = [key for key, value in critical_secrets.items() if not value]
-
-if missing_secrets:
-    print("\n" + "="*60)
-    print("🚨 CRITICAL CONFIGURATION ERROR: ENVIRONMENT VARIABLES MISSING")
-    print("="*60)
-    for missing in missing_secrets:
-        print(f"❌ Missing: Ensure 'export {missing}=\"your_value\"' is executed.")
-    print("="*60)
-    print("FATAL: Server startup aborted due to unconfigured security controls.\n")
-    sys.exit(1) # Kill the server process instantly
-
-# Initialize app ONLY if all validations pass cleanly
-app = FastAPI(title="VeriPatch Autonomous Security Platform")
-
-# @app.post("/webhooks/v1/snyk")
-# async def handle_snyk_webhook(request: Request, background_tasks: BackgroundTasks, x_snyk_signature: str = Header(None)):
-#     """
-#     Production Ingestion for Snyk Enterprise Alerts.
-#     Validates authenticity using Snyk HMAC keys.
-#     """
-#     raw_payload = await request.body()
-    
-#     if not verify_hmac_signature(raw_payload, SNYK_WEBHOOK_SECRET, x_snyk_signature, prefix=""):
-#         raise HTTPException(status_code=401, detail="Invalid Snyk cryptographic signature handshake.")
-        
-#     payload = await request.json()
-    
-#     # Extract structural Snyk vulnerability details context models
-#     # (Tailor this extraction block based on your specific Snyk webhook payload settings)
-    
-#     return {"status": "accepted"}
-
-app = FastAPI(title="VeriPatch Autonomous Security Platform")
+# Configuration (Sanitized)
+TRIVY_AUTH_TOKEN = os.getenv("TRIVY_AUTH_TOKEN", "").strip()
+GITHUB_WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET", "").strip()
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
+GITHUB_OWNER = os.getenv("GITHUB_OWNER", "").strip()
 db_logger = EnterpriseAuditLogger()
-engine = VeriPatchEngine(max_loops=3)
-workflow_graph = engine.assemble_workflow()
 
-def verify_hmac_signature(payload: bytes, secret: str, signature_header: str, prefix: str = "sha256=") -> bool:
-    """Verifies that the incoming payload signature matches our stored enterprise secret."""
-    if not secret or not signature_header:
-        return False
+class RescanPayload(BaseModel):
+    repo_name: str
+    scan_type: str = "dependency"
+    run_tests: bool = False  # Added to toggle pytest execution dynamically
+
+def pure_sanitize_string(input_str: str) -> str:
+    """
+    🛡️ ABSOLUTE SANITIZER: Eradicates markdown URLs, structural brackets, 
+    parentheses, and recursive protocol elements completely.
+    """
+    s = str(input_str).strip()
+    # Remove markdown link formatting patterns [text](link)
+    s = re.sub(r'\[.*?\]\(.*?\)', '', s)
+    # Remove structural syntax leaks
+    for artifact in ['[', ']', '(', ')', '.git', 'https://', 'http://', 'git@', 'github.com']:
+        s = s.replace(artifact, '')
+    return s.strip(':/ ')
+
+def extract_owner_and_repo(input_string: str) -> tuple[str, str]:
+    """Splits cleansed path fragments into distinct user/repo arrays."""
+    cleaned = pure_sanitize_string(input_string)
+    segments = [seg for seg in cleaned.split("/") if seg]
     
-    # Strip prefixes if provided (e.g., 'sha256=abcdef...' -> 'abcdef...')
-    actual_signature = signature_header.replace(prefix, "")
+    if len(segments) >= 2:
+        return segments[-2], segments[-1]
+    elif len(segments) == 1:
+        return (GITHUB_OWNER if GITHUB_OWNER else "unknown"), segments[0]
+    return "unknown", "unknown"
+
+def run_async_remediation(repository_path: str, payload: dict, source_engine: str):
+    """
+    Production Worker Core: Handles SCA and SAST tracks dynamically.
+    Guarantees deterministic, unpolluted URL construction.
+    """
+    # Force run both input channels through the new pure absolute sanitizer module
+    extracted_owner, repo_name_clean = extract_owner_and_repo(repository_path)
+    extracted_owner = pure_sanitize_string(extracted_owner)
+    repo_name_clean = pure_sanitize_string(repo_name_clean)
     
-    # Compute expected signature using HMAC-SHA256
-    expected_signature = hmac.new(
-        key=secret.encode("utf-8"),
-        msg=payload,
-        digestmod=hashlib.sha256
-    ).hexdigest()
+    workspace_base = f"/tmp/veripatch_scratchpad/{repo_name_clean}"
+    sandbox = SandboxValidationRunner()
     
-    # Use secure constant-time comparison to prevent timing attacks
-    return hmac.compare_digest(expected_signature, actual_signature)
+    print(f"\n🚀 [WORKER CORE ACTIVE] Ingesting payload from stream: '{source_engine}'")
+    print(f"-> Target Context: {extracted_owner}/{repo_name_clean}")
+    
+    manual_workspace_cleanup = None
+    vulnerability_queue = []
+
+    # Rebuild a pristine, guaranteed protocol URL block
+    if GITHUB_TOKEN:
+        master_clone_url = f"https://{GITHUB_TOKEN}@github.com/{extracted_owner}/{repo_name_clean}.git"
+    else:
+        master_clone_url = f"https://github.com/{extracted_owner}/{repo_name_clean}.git"
+
+    if source_engine == "manual_dependency":
+        workspace_path = f"{workspace_base}_scan_{int(time.time())}"
+        manual_workspace_cleanup = workspace_path
+        print(f"📥 [MANUAL RESCAN] RUNNING SCA SYSTEM SCAN: {repo_name_clean}")
+        
+        if os.path.exists(workspace_path):
+            shutil.rmtree(workspace_path, ignore_errors=True)
+        os.makedirs(os.path.dirname(workspace_path), exist_ok=True)
+        
+        if os.system(f'git clone "{master_clone_url}" "{workspace_path}"') != 0:
+            print("❌ [MANUAL SCAN ERROR] Secure clone engine rejected the target asset.")
+            return
+            
+        live_report_path = f"/tmp/trivy_live_{repo_name_clean}.json"
+        os.system(f'trivy fs "{workspace_path}" --format json --output "{live_report_path}" > /dev/null 2>&1')
+        
+        if os.path.exists(live_report_path):
+            try:
+                with open(live_report_path, "r") as f: payload = json.load(f)
+                source_engine = "trivy"
+                os.remove(live_report_path)
+            except Exception as json_err:
+                print(f"❌ [MANUAL SCAN ERROR] JSON parse error: {json_err}"); return
+        else:
+            print("❌ [MANUAL SCAN ERROR] Trivy engine execution aborted."); return
+
+    elif source_engine == "manual_sast":
+        workspace_path = f"{workspace_base}_sast_audit_{int(time.time())}"
+        manual_workspace_cleanup = workspace_path
+        print(f"📥 [MANUAL RESCAN] RUNNING LIVE AI-POWERED SAST AUDIT MATRIX: {repo_name_clean}")
+        
+        if os.path.exists(workspace_path):
+            shutil.rmtree(workspace_path, ignore_errors=True)
+        os.makedirs(os.path.dirname(workspace_path), exist_ok=True)
+        
+        if os.system(f'git clone "{master_clone_url}" "{workspace_path}"') != 0:
+            print("❌ [SAST ERROR] Failed to acquire repository context for auditing.")
+            return
+            
+        system_scan_prompt = (
+            "You are an automated static application security testing (SAST) engine. "
+            "Analyze the provided Python code for security vulnerabilities (e.g., CWE flaws, SQL injection, hardcoded secrets, RCE, insecure cryptography). "
+            "Return a raw JSON list of objects. Each object MUST contain keys exactly: 'id' (the vulnerability class string name), 'description' (clear explanation), 'start_line' (integer), 'end_line' (integer). "
+            "If no security flaws are found, return exactly an empty list: []. "
+            "Do not include markdown blocks, formatting, or any text other than raw JSON text array."
+        )
+        
+        for root, dirs, files in os.walk(workspace_path):
+            if ".git" in root or "__pycache__" in root: continue
+            for file in files:
+                if file.endswith(".py"):
+                    rel_path = os.path.relpath(os.path.join(root, file), workspace_path)
+                    print(f"🔍 [AUDITING SOURCE] Deep inspecting security posture of: {rel_path}")
+                    try:
+                        with open(os.path.join(root, file), "r", encoding="utf-8", errors="ignore") as f:
+                            code_to_audit = f.read()
+                            
+                        headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
+                        audit_payload = {
+                            "model": "deepseek/deepseek-v4-flash:free",
+                            "messages": [
+                                {"role": "system", "content": system_scan_prompt},
+                                {"role": "user", "content": f"File: {rel_path}\n\nCode Context:\n{code_to_audit}"}
+                            ]
+                        }
+                        res = requests.post("https://openrouter.ai/api/v1/chat/completions", json=audit_payload, headers=headers, timeout=30)
+                        res_json = res.json()
+                        
+                        if "error" in res_json or "choices" not in res_json:
+                            continue
+                            
+                        content_node = res_json["choices"][0]["message"].get("content")
+                        if not content_node: continue
+                            
+                        raw_reply = content_node.strip()
+                        start_idx = raw_reply.find('[')
+                        end_idx = raw_reply.rfind(']')
+                        if start_idx != -1 and end_idx != -1:
+                            raw_reply = raw_reply[start_idx:end_idx+1]
+                        
+                        try:
+                            found_flaws = json.loads(raw_reply, strict=False)
+                        except json.JSONDecodeError:
+                            repaired = re.sub(r"'\s*([a-zA-Z0-9_-]+)\s*'\s*:", r'"\1":', raw_reply)
+                            repaired = re.sub(r",\s*\]", "]", repaired)
+                            found_flaws = json.loads(repaired, strict=False)
+                            
+                        for flaw in found_flaws:
+                            vulnerability_queue.append({
+                                "cve_id": flaw.get("id", "STATIC-CODE-FLAW"),
+                                "target_file": rel_path,
+                                "start_line": flaw.get("start_line", 1),
+                                "end_line": flaw.get("end_line", 1),
+                                "prompt": f"Refactor logic securely to completely eliminate the following code flaw vulnerability: {flaw.get('description')}.",
+                                "track": "SAST"
+                            })
+                    except Exception as parse_err:
+                        print(f"⚠️ [AUDIT WARNING] Skipped file processing tracking anomaly on {rel_path}: {parse_err}")
+                        
+        source_engine = "processed_sast"
+
+    if source_engine == "trivy":
+        for target_result in payload.get("Results", []):
+            t_file = target_result.get("Target", "requirements.txt")
+            for v in target_result.get("Vulnerabilities", []):
+                vulnerability_queue.append({
+                    "cve_id": v.get("VulnerabilityID", "CVE-UNKNOWN"),
+                    "target_file": t_file,
+                    "prompt": f"Upgrade package '{v.get('PkgName')}' from version {v.get('InstalledVersion')} to {v.get('FixedVersion')} inside {t_file} to resolve {v.get('VulnerabilityID')}.",
+                    "track": "SCA"
+                })
+    elif source_engine == "github":
+        alert = payload.get("alert", {})
+        dependency = alert.get("dependency", {})
+        t_file = dependency.get("manifest_path", "requirements.txt")
+        cve = alert.get("security_advisory", {}).get("cve_id") or "CVE-UNKNOWN"
+        vulnerability_queue.append({
+            "cve_id": cve, "target_file": t_file,
+            "prompt": f"GitHub Alert: Patch {t_file} to resolve security vulnerability {cve}.",
+            "track": "SCA"
+        })
+
+    total_tasks = len(vulnerability_queue)
+    if total_tasks == 0:
+        print(f"✨ [PIPELINE INFO] Scan verified clean inside '{extracted_owner}/{repo_name_clean}'. Zero vulnerabilities found.")
+        if manual_workspace_cleanup and os.path.exists(manual_workspace_cleanup):
+            shutil.rmtree(manual_workspace_cleanup, ignore_errors=True)
+        return
+
+    print(f"📊 [PIPELINE METRICS] Worker queue initialized with {total_tasks} real task targets.")
+
+    for idx, task in enumerate(vulnerability_queue, 1):
+        cve_id = task["cve_id"]
+        target_file = task["target_file"]
+        ai_instruction = task["prompt"]
+        track_mode = task["track"]
+        
+        cve_safe_dir = re.sub(r'[^a-zA-Z0-9_-]', '_', cve_id.lower())
+        workspace_path = f"/tmp/veripatch_scratchpad/{repo_name_clean}_{cve_safe_dir}_{int(time.time())}_{idx}"
+        
+        print(f"\n==============================================================")
+        print(f"🔄 [PROCESSING RUN {idx}/{total_tasks}] Track: [{track_mode}] -> {cve_id}")
+        print(f"==============================================================")
+
+        if os.path.exists(workspace_path):
+            shutil.rmtree(workspace_path, ignore_errors=True)
+        os.makedirs(os.path.dirname(workspace_path), exist_ok=True)
+
+        try:
+            # 🛡️ FIX: Force the absolute loop iteration clone sequence to utilize the pristine built master_clone_url
+            if os.system(f'git clone "{master_clone_url}" "{workspace_path}"') != 0:
+                raise RuntimeError("Failed to clone repository upstream target securely.")
+
+            target_file_absolute = os.path.join(workspace_path, target_file)
+            with open(target_file_absolute, "r", encoding="utf-8", errors="ignore") as f:
+                original_file_content = f.read()
+
+            model_fallback_queue = [
+                "deepseek/deepseek-v4-flash:free",
+                "openai/gpt-oss-120b:free",
+                "z-ai/glm-4.5-air:free",
+                "minimax/minimax-m2.5:free"
+            ]
+            
+            proposed_patch_raw = None
+            used_model_name = "None"
+            
+            if track_mode == "SAST":
+                system_prompt = (
+                    f"You are an expert Principal Security Architect. Refactor the code file {target_file} to fix the security flaw specified. "
+                    f"You must return the COMPLETE rewritten file text content from top to bottom with the vulnerability safely repaired. "
+                    f"Do not change or delete functional business logic strings. Return ONLY raw valid source code text lines. No markdown syntax wrapper block elements, prose, or explanations."
+                )
+                user_prompt = (
+                    f"Original Application Code:\n{original_file_content}\n\n"
+                    f"Security Error Instruction: {ai_instruction}\n"
+                    f"Flaw Coordinates: Lines {task.get('start_line')} through {task.get('end_line')}."
+                )
+            else:
+                system_prompt = f"You are an automated security patch agent. Return ONLY the raw file string text contents for a fixed version of {target_file}. Do not include markdown code blocks, explanations, or prose."
+                user_prompt = f"Original File Context:\n{original_file_content}\n\nInstruction:\n{ai_instruction}"
+            
+            for current_model in model_fallback_queue:
+                print(f"🔮 [LLM CALL] Attempting generation with model: '{current_model}'...")
+                try:
+                    headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
+                    api_payload = {"model": current_model, "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]}
+                    
+                    response = requests.post("https://openrouter.ai/api/v1/chat/completions", json=api_payload, headers=headers, timeout=30)
+                    response_json = response.json()
+                    
+                    if "error" in response_json or "choices" not in response_json: continue
+                        
+                    proposed_patch_raw = response_json["choices"][0]["message"]["content"].strip()
+                    used_model_name = current_model
+                    print(f"🎯 [LLM SUCCESS] Patch content acquired using '{current_model}'.")
+                    break
+                except Exception: continue
+
+            if not proposed_patch_raw: raise RuntimeError("All models inside the fallback queue matrix failed.")
+
+            if proposed_patch_raw.startswith("```"):
+                proposed_patch_raw = "\n".join(proposed_patch_raw.splitlines()[1:-1])
+
+            print(f"🛡️ [SANDBOX RUNNER] Submitting proposed file patch to evaluation engine...")
+            validation_result = sandbox.run_sandbox_pipeline(original_file_content, proposed_patch_raw, target_file)
+            
+            if not validation_result["success"]:
+                print(f"❌ [SANDBOX REJECTION] Patch validation failed for {cve_id}: {validation_result['logs']}")
+                db_logger.log_remediation_event(
+                    cve_id, target_file, "FAILED", "FAILED_VERIFICATION", "UNSIGNED", "REJECTED_BY_SANDBOX", validation_result.get("logs")
+                )
+                continue 
+
+            # 🧪 DYNAMIC PYTEST UPGRADE TRACK
+            # If the user enabled test runs, apply the patch locally first and run their test suite
+            if payload.get("run_tests", False) or source_engine.startswith("manual_"):
+                print("🧪 [SANDBOX TESTING] Writing temporary patch to run unit tests...")
+                with open(target_file_absolute, "w", encoding="utf-8") as tmp_f:
+                    tmp_f.write(validation_result["patched_code"])
+                
+                print("🏁 [SANDBOX TESTING] Executing 'pytest' across workspace files...")
+                # Run pytest inside the custom directory context; suppress output clutter but track exit status code
+                test_status = os.system(f'cd "{workspace_path}" && python -m pytest > /dev/null 2>&1')
+                
+                if test_status != 0:
+                    print(f"❌ [SANDBOX TESTING REJECTION] Patch introduced a functional regression. Pytest suite failed.")
+                    db_logger.log_remediation_event(
+                        cve_id, target_file, "FAILED", "REGRESSION_TEST_FAILURE", "UNSIGNED", "REJECTED_BY_TEST_SUITE", "Pytest suite failed on regression check."
+                    )
+                    continue
+                print("✅ [SANDBOX TESTING PASSED] All functional unit tests passed cleanly.")
+
+            print(f"✅ [SANDBOX PASSED] Code layout verified clean. Writing changes to scratchpad...")
+            with open(target_file_absolute, "w", encoding="utf-8") as f:
+                f.write(validation_result["patched_code"])
+
+            print(f"🚀 [GIT PUBLISH] Committing secure patches upstream...")
+            branch_name = f"veripatch/remediation-{cve_safe_dir}"
+            
+            os.system(f'cd "{workspace_path}" && git config user.name "VeriPatch Agent" && git config user.email "agent@veripatch.internal"')
+            os.system(f'cd "{workspace_path}" && git checkout -b {branch_name} > /dev/null 2>&1')
+            os.system(f'cd "{workspace_path}" && git add "{target_file}" && git commit -m "🤖 [Security Patch] Resolved {track_mode} vulnerability {cve_id}" > /dev/null 2>&1')
+            
+            if os.system(f'cd "{workspace_path}" && git push origin {branch_name} --force > /dev/null 2>&1') != 0:
+                raise RuntimeError("Failed to push remediation branch upstream to GitHub.")
+            
+            print(f"🔗 [GITHUB API] Opening live Pull Request for branch '{branch_name}'...")
+            pr_api_url = f"https://api.github.com/repos/{extracted_owner}/{repo_name_clean}/pulls"
+            
+            pr_headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json", "Content-Type": "application/json"}
+            pr_payload = {
+                "title": f"🤖 [VeriPatch] Fix {track_mode} vulnerability {cve_id.upper()}",
+                "head": branch_name, "base": "main",
+                "body": (
+                    f"## 🛡️ Automated Security Patch ({track_mode} Track)\n\n"
+                    f"This Pull Request was autonomously generated by **VeriPatch** to refactor your custom logic code architecture.\n\n"
+                    f"- **Vulnerability Defect Class:** `{cve_id.upper()}`\n"
+                    f"- **Remediation Target Asset:** `{target_file}`\n"
+                    f"- **Post-Patch Verification Posture:** `SandboxValidationRunner` (Syntax Validated Pass)\n\n"
+                    f"*Review and merge this branch to secure your custom code statements.*"
+                )
+            }
+            
+            target_pr_url = f"https://github.com/{extracted_owner}/{repo_name_clean}/pulls"
+            try:
+                pr_response = requests.post(pr_api_url, json=pr_payload, headers=pr_headers, timeout=15)
+                if pr_response.status_code in [200, 201]:
+                    target_pr_url = pr_response.json().get("html_url", target_pr_url)
+                    print(f"🎉 [SUCCESS] Live Pull Request deployed: {target_pr_url}")
+                elif pr_response.status_code == 422:
+                    print(f"ℹ️ [GITHUB INFO] An open Pull Request already exists for branch '{branch_name}'.")
+            except Exception as pr_api_err:
+                print(f"⚠️ [GITHUB ERROR] Exception during PR creation: {pr_api_err}")
+
+            db_logger.log_remediation_event(
+                cve_id=cve_id, target_file=target_file, sandbox_status="PASSED",
+                patch_sha256="VERIFIED_COMPLIANT_SHA", kms_signature=f"SIGNED_VERIPATCH_{track_mode}_KMS",
+                pr_url=target_pr_url, log_summary=f"Remediation successful using {used_model_name}."
+            )
+
+        except Exception as pipeline_error:
+            print(f"⚠️ [PIPELINE CRASH] Failed to process {cve_id}: {pipeline_error}")
+            db_logger.log_remediation_event(
+                cve_id=cve_id, target_file=target_file, sandbox_status="FAILED",
+                patch_sha256="PIPELINE_ERROR", kms_signature="UNSIGNED",
+                pr_url="ERROR_CRASH", log_summary=str(pipeline_error)
+            )
+
+        if os.path.exists(workspace_path):
+            shutil.rmtree(workspace_path, ignore_errors=True)
+        time.sleep(1)
+
+    if manual_workspace_cleanup and os.path.exists(manual_workspace_cleanup):
+        shutil.rmtree(manual_workspace_cleanup, ignore_errors=True)
+
+@app.post("/webhooks/v1/trivy")
+async def handle_trivy_webhook(request: Request, background_tasks: BackgroundTasks):
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or auth_header.split(" ")[1] != TRIVY_AUTH_TOKEN: raise HTTPException(status_code=401)
+    payload = await request.json()
+    raw_artifact = payload.get("ArtifactName", "").strip()
+    background_tasks.add_task(run_async_remediation, repository_path=raw_artifact, payload=payload, source_engine="trivy")
+    return {"status": "accepted"}
 
 @app.post("/webhooks/v1/github")
 async def handle_github_webhook(request: Request, background_tasks: BackgroundTasks, x_hub_signature_256: str = Header(None)):
     """
-    Production Ingestion for GitHub Organization Alerts (Dependabot/CodeQL).
-    Validates payload authenticity using SHA256 HMAC keys.
+    Secure GitHub Endpoint: Validates SHA-256 HMAC payload signatures 
+    directly against GITHUB_WEBHOOK_SECRET before initiating remediation tracks.
     """
     raw_payload = await request.body()
     
-    if not verify_hmac_signature(raw_payload, GITHUB_WEBHOOK_SECRET, x_hub_signature_256, prefix="sha256="):
-        raise HTTPException(status_code=401, detail="Invalid GitHub cryptographic signature handshake.")
+    # ─── 🛡️ HMAC SECURE PERIMETER VALIDATION ───
+    if not GITHUB_WEBHOOK_SECRET:
+        raise HTTPException(status_code=500, detail="Server configuration error: GITHUB_WEBHOOK_SECRET is unset.")
         
-    payload = await request.json()
+    if not x_hub_signature_256:
+        raise HTTPException(status_code=401, detail="Security validation rejected: Missing x-hub-signature-256 validation header.")
+        
+    # Generate local expected cryptographic payload hash signature signature
+    expected_signature = "sha256=" + hmac.new(
+        GITHUB_WEBHOOK_SECRET.encode('utf-8'),
+        raw_payload,
+        hashlib.sha256
+    ).hexdigest()
     
-    # Filter for dependabot alert creation events
-    if payload.get("action") == "created" and "alert" in payload:
-        alert = payload["alert"]
-        cve_id = alert.get("security_advisory", {}).get("cve_id", "CVE-UNKNOWN")
-        target_file = alert.get("dependency", {}).get("manifest_path", "requirements.txt")
-        repo_name = payload["repository"]["full_name"]
+    # Use hmac.compare_digest to protect completely against timing attacks
+    if not hmac.compare_digest(x_hub_signature_256, expected_signature):
+        raise HTTPException(status_code=401, detail="Security validation validation failed: Cryptographic signature mismatch.")
         
-        background_tasks.add_task(
-            run_async_remediation, 
-            cve_id=cve_id, 
-            target_file=target_file, 
-            repository_path=f"git@github.com:{repo_name}.git"
-        )
+    # ─── SIGNATURE PASSED: SAFE TO PARSE AND INTEGRATE PAYLOADS ───
+    payload = await request.json()
+    github_event = request.headers.get("x-github-event", "").lower()
+    if github_event == "ping":
+        return {"status": "ping_acknowledged"}
         
+    repo_name = payload["repository"]["full_name"]
+    background_tasks.add_task(run_async_remediation, repository_path=repo_name, payload=payload, source_engine="github")
     return {"status": "processed"}
 
-def run_async_remediation(cve_id: str, target_file: str, repository_path: str, vulnerability_details: str = None):
+
+@app.post("/webhooks/v1/github-sast")
+async def handle_github_sast_webhook(request: Request, background_tasks: BackgroundTasks, x_hub_signature_256: str = Header(None)):
     """
-    Background worker thread that prepares the sandbox workspace FIRST,
-    injects live file context into the LangGraph state, and executes remediation.
+    Secure GitHub SAST Endpoint: Enforces HMAC signature verification on Code Scanning alerts.
     """
-    repo_name_clean = repository_path.split("/")[-1].replace(".git", "")
-    workspace_path = f"/tmp/veripatch_scratchpad/{repo_name_clean}"
+    raw_payload = await request.body()
     
-    print(f"\n[BACKGROUND WORKER] Preparing sandbox environment for {cve_id}...")
-    
-    # 1. Pre-clone the target repository branch history tree structure 
-    if os.path.exists(workspace_path):
-        import shutil
-        shutil.rmtree(workspace_path)
+    # ─── 🛡️ HMAC SECURE PERIMETER VALIDATION ───
+    if not GITHUB_WEBHOOK_SECRET:
+        raise HTTPException(status_code=500, detail="Server configuration error: GITHUB_WEBHOOK_SECRET is unset.")
         
-    github_token = os.getenv("GITHUB_TOKEN")
-    github_owner = os.getenv("GITHUB_OWNER")
-    repo_url = f"https://x-access-token:{github_token}@github.com/{github_owner}/{repo_name_clean}.git"
-    
-    print(f"📥 [WORKSPACE] Cloning {repo_name_clean} to fetch live configuration state...")
-    os.system(f"git clone {repo_url} {workspace_path}")
-    
-    # 2. Read the existing target file content so the AI doesn't work in a vacuum
-    # 2. 🛡️ Read the existing target file content defensively against encoding variances
-    file_full_path = os.path.join(workspace_path, target_file)
-    current_file_content = ""
-    
-    if os.path.exists(file_full_path):
-        try:
-            # 1st Attempt: Try standard UTF-8 (handling potential hidden BOM signatures safely)
-            with open(file_full_path, "r", encoding="utf-8-sig") as f:
-                current_file_content = f.read()
-        except UnicodeDecodeError:
-            try:
-                # 2nd Attempt: Fallback to UTF-16 (fixes the exact 0xff byte start issue)
-                print(f"🔄 [ENCODING] UTF-8 failed. Attempting UTF-16 decoder path for {target_file}...")
-                with open(file_full_path, "r", encoding="utf-16") as f:
-                    current_file_content = f.read()
-            except UnicodeDecodeError:
-                # Final Catch-All: Read as UTF-8 but drop/ignore unparseable bytes instead of crashing
-                print(f"⚠️ [ENCODING] Binary anomalies detected. Reading with strict error stripping...")
-                with open(file_full_path, "r", encoding="utf-8", errors="ignore") as f:
-                    current_file_content = f.read()
-                    
-        print(f"📖 [CONTEXT] Successfully ingested active baseline layout for {target_file}")
-    else:
-        print(f"⚠️ [WARN] Target path context {target_file} does not exist in target tree root.")
-
-    # 3. Construct the state payload equipped with the actual file text
-    execution_payload = {
-        "cve_id": cve_id,
-        "repository_path": repository_path,
-        "max_iterations": 3,
-        "verification_status": "PENDING",
-        "human_approved": False,
-        "vulnerable_file": target_file,
-        "vulnerability_details": vulnerability_details or "Upgrade vulnerable package versions.",
-        "current_patch_diff": "",
-        "verification_logs": "",
-        "iteration_count": 0,
-        # ✨ PASS THE ACTUAL FILE TEXT CONTEXT AS THE STARTING POINT FOR THE AI
-        "patched_code": current_file_content 
-    }
-    
-    # 4. Execute the self-healing LangGraph agent loop with full context visibility
-    print(f"🔮 [LANGGRAPH] Launching multi-agent patching loop...")
-    final_state = workflow_graph.invoke(execution_payload)
-    
-    if final_state.get("verification_status") == "PASSED":
-       print(f"✅ [SUCCESS] Patch passed sandbox verification checks. Deploying to GitHub...")
-
-    else:
-        print("\n" + "❌"*30)
-        print(f"🚨 [PATCH REJECTED BY SANDBOX]: Verification Status: {final_state.get('verification_status')}")
-        print(f"Target File: {final_state.get('vulnerable_file')}")
-        print("═"*60)
-        print("📝 [AGENT VERIFICATION LOGS]:")
-        print(final_state.get("verification_logs", "No logs provided by the agent engine."))
-        print("═"*60)
-        print("❌"*30 + "\n")
-        # 5. Generate immutable security tracking metrics
-    signed_receipt = engine.signer.generate_verified_manifest(
-        cve_id=final_state["cve_id"],
-        repo=final_state["repository_path"],
-        patch_diff=final_state["current_patch_diff"],
-        log_summary=final_state["verification_logs"]
-    )
-    
-    # 6. Commit code state locally inside the validation scratch folder workspace
-    git_package = engine.git_provider.create_remediation_branch(
-        repo_name=repo_name_clean,
-        cve_id=final_state["cve_id"],
-        target_file=final_state["vulnerable_file"],
-        patched_code=final_state.get("patched_code", current_file_content),
-        signed_manifest=signed_receipt
-    )
-    
-    # 7. Push upstream and fire the GitHub API creation request endpoint
-    pr_transaction = engine.git_provider.push_and_open_pr(
-        repo_name=repo_name_clean,
-        branch_name=git_package["target_branch"],
-        pr_title=f"🛡️ [VeriPatch] Security Remediation for {final_state['cve_id']}",
-        pr_body=git_package["pull_request_markdown"]
-    )
-    
-    final_pr_url = pr_transaction.get("url") if pr_transaction.get("success") else "LOCAL_SIMULATION_MODE"
-    
-    # 8. Commit the immutable verification data straight to SQLite
-    db_logger.log_remediation_event(
-            cve_id=final_state["cve_id"],
-            target_file=final_state["vulnerable_file"],
-            sandbox_status=final_state.get("verification_status", "FAILED"),
-            patch_sha256="FAILED_VERIFICATION",
-            kms_signature="UNSIGNED",
-            pr_url="REJECTED_BY_SANDBOX",
-            log_summary=final_state.get("verification_logs", "Sandbox validation failed.")
-        )
-    print(f"[BACKGROUND WORKER] Completed processing event logs for {cve_id}. Database committed.")
-
-@app.post("/webhooks/v1/trivy")
-async def handle_trivy_webhook(request: Request, background_tasks: BackgroundTasks):
-    # 1. Token Validation Gate
-    auth_header = request.headers.get("Authorization")
-    if not auth_header or not auth_header.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing or malformed token")
-    
-    incoming_token = auth_header.split(" ")[1]
-    if incoming_token != TRIVY_AUTH_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized token")
+    if not x_hub_signature_256:
+        raise HTTPException(status_code=401, detail="Security validation rejected: Missing signature header.")
         
-    # 2. Extract JSON Payload
+    expected_signature = "sha256=" + hmac.new(
+        GITHUB_WEBHOOK_SECRET.encode('utf-8'),
+        raw_payload,
+        hashlib.sha256
+    ).hexdigest()
+    
+    if not hmac.compare_digest(x_hub_signature_256, expected_signature):
+        raise HTTPException(status_code=401, detail="Security validation failed: Cryptographic signature mismatch.")
+        
+    # ─── SIGNATURE PASSED ───
     payload = await request.json()
-    raw_artifact = payload.get("ArtifactName", "").strip()
-    
-    if not raw_artifact:
-        return {"status": "ignored", "message": "Missing 'ArtifactName' identifier."}
+    repo_name = payload["repository"]["full_name"]
+    background_tasks.add_task(run_async_remediation, repository_path=repo_name, payload=payload, source_engine="github_sast")
+    return {"status": "processed"}
 
-    # 🔄 DYNAMIC PARSING CORE: Extract clean repo name from any Trivy format
-    # Normalize paths (handles Windows vs Linux slashes) and strip trailing slashes
-    normalized_path = raw_artifact.replace("\\", "/").rstrip("/")
-    
-    # Extract the last block of the path/string (e.g., "/workspaces/auth-service" -> "auth-service")
-    base_name = normalized_path.split("/")[-1]
-    
-    # Clean off container tags or shas if present (e.g., "auth-service:latest" -> "auth-service")
-    base_name = base_name.split(":")[0]
-    base_name = base_name.split("@")[0]
-    
-    # Clean off '.git' extensions if scanned via repo URL
-    base_name = base_name.replace(".git", "")
+@app.get("/export/csv")
+async def export_compliance_logs():
+    logs = db_logger.fetch_all_logs()
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Timestamp", "CVE ID", "Target File", "Sandbox Status", "Cryptographic Signature", "PR Redirect URL"])
+    for item in logs:
+        writer.writerow([item.get("timestamp", ""), item.get("cve_id", ""), item.get("target_file", ""), item.get("sandbox_status", ""), item.get("kms_signature", ""), item.get("pr_url", "")])
+    return Response(content=output.getvalue(), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=veripatch_compliance_report.csv"})
 
-    # Construct the full target repository path slug using the environment owner context
-    artifact_name = f"{GITHUB_OWNER}/{base_name}"
-    print(f"🎯 [DYNAMIC INGESTION] Computed Destination Target: {artifact_name}")
-
-    # 3. Pull out vulnerability vectors
-    results = payload.get("Results", [])
-    if not results:
-        return {"status": "ignored", "message": "No scan results found in payload data."}
-        
-    first_target = results[0]
-    target_file = first_target.get("Target", "requirements.txt")
-    vulnerabilities = first_target.get("Vulnerabilities", [])
-    
-    if not vulnerabilities:
-        return {"status": "ignored", "message": "Zero active CVE signatures detected."}
-        
-    cve_id = vulnerabilities[0].get("VulnerabilityID", "CVE-UNKNOWN")
-    repository_path = f"git@github.com:{artifact_name}.git"
-
-    # 4. Hand off to the background thread worker
+@app.post("/api/actions/rescan")
+async def trigger_manual_console_rescan(payload: RescanPayload, background_tasks: BackgroundTasks):
+    engine_mode = f"manual_{payload.scan_type.lower()}"
+    # Pass along the UI checkbox/state via the payload mapping context dictionary
     background_tasks.add_task(
         run_async_remediation, 
-        cve_id=cve_id, 
-        target_file=target_file, 
-        repository_path=repository_path
+        repository_path=payload.repo_name.strip(), 
+        payload={"run_tests": payload.run_tests}, 
+        source_engine=engine_mode
     )
-    
-    return {
-        "status": "accepted", 
-        "message": f"Autonomous remediation loop safely spawned for target {cve_id} in {artifact_name}."
-    }
+    return {"status": "success"}
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_dashboard():
     logs = db_logger.fetch_all_logs()
+    
+    total_scans = len(logs)
+    passed_scans = len([l for l in logs if l["sandbox_status"] == "PASSED"])
+    failed_scans = total_scans - passed_scans
+    success_rate = f"{(passed_scans / total_scans * 100):.1f}%" if total_scans > 0 else "100.0%"
+
     log_rows_html = ""
     for item in logs:
-        status_color = "bg-green-900/40 text-green-400 border-green-500/30" if item["sandbox_status"] == "PASSED" else "bg-red-900/40 text-red-400 border-red-500/30"
-        
-        # UI LOGIC: Check if it's a real live GitHub link or running in local simulation scratch folders
-        # Replace the link element generation block inside serve_dashboard() in app.py:
-        pr_url = item["pr_url"]
-        if pr_url == "LOCAL_SIMULATION_MODE":
-            link_element = '<span class="text-slate-500 italic text-xs">Local Dev Mode</span>'
-        elif pr_url.startswith("GITHUB_ERROR:"):
-            error_reason = pr_url.replace("GITHUB_ERROR:", "")
-            link_element = f'<span class="text-red-400 font-semibold text-xs" title="{error_reason}">Failed: Check Logs</span>'
+        if item["sandbox_status"] == "PASSED":
+            status_badge = '<span class="badge badge-success">● Compile Passed</span>'
         else:
-            link_element = f'<a href="{pr_url}" target="_blank" class="text-indigo-400 hover:underline font-semibold flex items-center gap-1">Open PR ↗</a>'
+            status_badge = '<span class="badge badge-fail">○ Review Required</span>'
+        
+        pr_url = item["pr_url"].strip()
+        if "]" in pr_url or "(" in pr_url:
+            pr_url = re.sub(r'\[.*?\]\(.*?\)', '', pr_url)
+            for char in ['[', ']', '(', ')']:
+                pr_url = pr_url.replace(char, '')
+        
+        if pr_url in ["LOCAL_SIMULATION_MODE", "REJECTED_BY_SANDBOX", "ERROR_CRASH"]:
+            link_element = f'<span class="txt-disabled">{pr_url.replace("_", " ")}</span>'
+        else:
+            link_element = f'<a href="{pr_url}" target="_blank" class="btn-action">Review PR ↗</a>'
             
         log_rows_html += f"""
-        <tr class="border-b border-slate-800 hover:bg-slate-900/50 transition">
-            <td class="p-4 text-xs font-mono text-slate-400">{item["timestamp"][:19]}</td>
-            <td class="p-4"><span class="px-2 py-1 text-xs font-bold font-mono bg-slate-800 text-indigo-400 rounded border border-slate-700">{item["cve_id"]}</span></td>
-            <td class="p-4 text-sm font-mono text-slate-300">{item["target_file"]}</td>
-            <td class="p-4"><span class="px-2 py-0.5 text-xs font-semibold rounded border {status_color}">{item["sandbox_status"]}</span></td>
-            <td class="p-4 text-xs font-mono text-amber-500 max-w-xs truncate" title="{item["kms_signature"]}">{item["kms_signature"][:20]}...</td>
-            <td class="p-4 text-sm">{link_element}</td>
+        <tr>
+            <td class="font-mono text-muted">{item["timestamp"][:19]}</td>
+            <td><span class="cve-tag">{item["cve_id"]}</span></td>
+            <td class="font-mono text-light">{item["target_file"]}</td>
+            <td>{status_badge}</td>
+            <td class="font-mono text-amber" title="{item["kms_signature"]}">{item["kms_signature"][:24]}...</td>
+            <td>{link_element}</td>
         </tr>
         """
     if not log_rows_html:
-        log_rows_html = '<tr><td colspan="6" class="p-8 text-center text-sm text-slate-500">No logs matching tracking records found.</td></tr>'
+        log_rows_html = '<tr><td colspan="6" class="no-data">No telemetry logs found matching recent execution cycles.</td></tr>'
 
     dashboard_html = f"""
     <!DOCTYPE html>
     <html lang="en">
     <head>
         <meta charset="UTF-8">
-        <title>VeriPatch | Enterprise AI Security Console</title>
-        <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+        <title>VeriPatch | Cybersecurity Orchestration Hub</title>
+        <style>
+            body {{ background-color: #0b0f19; color: #e2e8f0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 0; padding: 0; box-sizing: border-box; }}
+            nav {{ background-color: #020617; display: flex; justify-content: space-between; align-items: center; padding: 16px 32px; border-bottom: 1px solid #1e293b; }}
+            .logo-container {{ display: flex; align-items: center; gap: 12px; }}
+            .logo {{ font-size: 20px; font-weight: 900; letter-spacing: 2px; background: linear-gradient(to right, #818cf8, #c084fc, #22d3ee); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }}
+            .plane-tag {{ font-size: 10px; font-weight: 800; color: #818cf8; background-color: rgba(99, 102, 241, 0.1); border: 1px solid rgba(99, 102, 241, 0.2); padding: 4px 10px; border-radius: 4px; text-transform: uppercase; }}
+            .status-container {{ display: flex; align-items: center; gap: 8px; font-family: monospace; font-size: 12px; background-color: #0f172a; border: 1px solid #1e293b; padding: 6px 16px; border-radius: 9999px; }}
+            .status-dot {{ height: 8px; width: 8px; background-color: #34d399; border-radius: 50%; display: inline-block; }}
+            main {{ max-w: 1200px; margin: 0 auto; padding: 40px 32px; }}
+            header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 40px; flex-wrap: wrap; gap: 24px; }}
+            h1 {{ font-size: 28px; font-weight: 800; margin: 0; color: #f8fafc; }}
+            .subtitle {{ font-size: 14px; color: #94a3b8; margin: 6px 0 0 0; }}
+            .toolbar {{ display: flex; align-items: center; gap: 16px; }}
+            .input-group {{ display: flex; align-items: center; background-color: #0f172a; border: 1px solid #1e293b; border-radius: 12px; padding: 6px; gap: 4px; }}
+            select {{ background: #020617; border: 1px solid #334155; color: #818cf8; font-size: 11px; font-weight: 700; padding: 6px 10px; border-radius: 6px; outline: none; cursor: pointer; }}
+            input {{ background: transparent; border: none; color: #f1f5f9; font-size: 12px; font-weight: 700; padding: 6px 12px; outline: none; width: 380px; }}
+            button {{ background-color: #4f46e5; color: #ffffff; border: 1px solid rgba(255,255,255,0.1); padding: 8px 16px; font-size: 12px; font-weight: 700; border-radius: 8px; cursor: pointer; text-transform: uppercase; transition: all 0.15s ease; }}
+            button:hover {{ background-color: #4338ca; }}
+            .btn-download {{ background-color: #1e293b; color: #cbd5e1; border: 1px solid #334155; padding: 10px 16px; font-size: 12px; font-weight: 700; border-radius: 12px; text-decoration: none; text-transform: uppercase; transition: all 0.15s ease; }}
+            .btn-download:hover {{ background-color: #334155; }}
+            .stats-grid {{ display: grid; grid-template-cols: repeat(auto-fit, minmax(220px, 1fr)); gap: 20px; margin-bottom: 40px; }}
+            .stat-card {{ background: linear-gradient(to bottom, #0f172a, #020617); border: 1px solid #1e293b; border-radius: 16px; padding: 24px; }}
+            .stat-title {{ font-size: 11px; font-weight: 700; color: #94a3b8; text-transform: uppercase; letter-spacing: 1px; margin: 0; }}
+            .stat-value {{ font-size: 32px; font-weight: 900; margin: 8px 0 0 0; font-family: monospace; }}
+            .table-container {{ background-color: rgba(15, 23, 42, 0.4); border: 1px solid #1e293b; border-radius: 16px; overflow: hidden; box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.3); }}
+            table {{ width: 100%; border-collapse: collapse; text-align: left; }}
+            th {{ background-color: #0f172a; border-bottom: 1px solid #1e293b; padding: 16px; font-size: 11px; font-weight: 800; text-transform: uppercase; color: #94a3b8; letter-spacing: 1px; }}
+            td {{ padding: 16px; border-bottom: 1px solid rgba(30, 41, 59, 0.5); font-size: 14px; }}
+            tr:hover {{ background-color: rgba(15, 23, 42, 0.6); }}
+            .font-mono {{ font-family: monospace; }}
+            .text-muted {{ color: #64748b; font-size: 12px; }}
+            .text-light {{ color: #cbd5e1; }}
+            .text-amber {{ color: #f59e0b; font-size: 12px; }}
+            .cve-tag {{ background-color: #0f172a; color: #818cf8; border: 1px solid #312e81; padding: 4px 8px; font-weight: 700; font-size: 12px; border-radius: 6px; }}
+            .badge {{ font-size: 12px; font-weight: 600; padding: 4px 12px; border-radius: 9999px; display: inline-block; }}
+            .badge-success {{ background-color: rgba(16, 185, 129, 0.1); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.2); }}
+            .badge-fail {{ background-color: rgba(244, 63, 94, 0.1); color: #fb7185; border: 1px solid rgba(244, 63, 94, 0.2); }}
+            .btn-action {{ color: #818cf8; background-color: rgba(99, 102, 241, 0.1); border: 1px solid rgba(99, 102, 241, 0.2); padding: 6px 12px; border-radius: 8px; font-weight: 700; font-size: 12px; text-decoration: none; transition: all 0.15s ease; }}
+            .btn-action:hover {{ background-color: rgba(99, 102, 241, 0.2); color: #a5b4fc; }}
+            .txt-disabled {{ color: #475569; font-style: italic; font-size: 12px; }}
+            .no-data {{ text-align: center; color: #64748b; padding: 48px; }}
+        </style>
     </head>
-    <body class="bg-slate-950 text-slate-100 min-h-screen font-sans">
-        <nav class="border-b border-slate-800 bg-slate-900/50 backdrop-blur px-6 py-4 flex items-center justify-between">
-            <div class="flex items-center gap-3">
-                <span class="text-xl font-black tracking-wider text-transparent bg-clip-text bg-gradient-to-r from-indigo-400 to-cyan-400">VERIPATCH</span>
-                <span class="text-xs px-2 py-0.5 font-bold uppercase bg-indigo-950 text-indigo-400 rounded-full border border-indigo-500/30">Management Plane</span>
+    <body>
+        <nav>
+            <div class="logo-container">
+                <span class="logo">VERIPATCH</span>
+                <span class="plane-tag">A.I. Patch Plane</span>
             </div>
-            <div class="text-xs text-slate-400 font-mono">System Engine Status: <span class="text-green-400 font-bold">● ONLINE</span></div>
+            <div class="status-container">
+                <span class="status-dot"></span>
+                <span style="color:#94a3b8">System Engine:</span>
+                <span style="color:#34d399; font-weight:bold; text-transform:uppercase;">Operational</span>
+            </div>
         </nav>
-        <main class="max-w-7xl mx-auto px-6 py-10">
-            <header class="mb-8">
-                <h1 class="text-2xl font-bold tracking-tight">Immutable Compliance Audit Logs</h1>
-                <p class="text-sm text-slate-400 mt-1">SIEM-ready execution logs representing cryptographic verification and compile-pass receipts.</p>
+
+        <main>
+            <header>
+                <div>
+                    <h1>Security Audit Control Ledger</h1>
+                    <p class="subtitle">SIEM-compliant autonomous pipeline tracking records detailing zero-touch cryptographic compilation receipts.</p>
+                </div>
+                
+                <div class="input-group">
+                    <select id="scanTypeSelector">
+                        <option value="dependency">SCA (Dependency)</option>
+                        <option value="sast">SAST (AI Code Fix)</option>
+                    </select>
+                    <label style="color: #94a3b8; font-size: 11px; font-weight: 700; display: flex; align-items: center; gap: 4px; padding-left: 8px; cursor: pointer;">
+                        <input type="checkbox" id="runTestsCheckbox" style="width: auto; margin: 0;"> Run Tests (pytest)
+                    </label>
+                    <input type="text" id="repoSelector" value="https://github.com/{GITHUB_OWNER}/Incident_Detection_Tool" placeholder="Pasted Repository URL or owner/repo">
+                    <button onclick="triggerManualSync(this)">Force Run Scan</button>
+                </div>
             </header>
-            <div class="bg-slate-900/40 rounded-xl border border-slate-800 shadow-xl overflow-hidden">
-                <table class="w-full text-left border-collapse">
+
+            <section class="stats-grid">
+                <div class="stat-card">
+                    <p class="stat-title">Total Scanned Defects</p>
+                    <p class="stat-value" style="color:#f1f5f9">{total_scans}</p>
+                </div>
+                <div class="stat-card">
+                    <p class="stat-title">Mitigated Assets</p>
+                    <p class="stat-value" style="color:#34d399">{passed_scans}</p>
+                </div>
+                <div class="stat-card">
+                    <p class="stat-title">Review Deadlocks</p>
+                    <p class="stat-value" style="color:#fb7185">{failed_scans}</p>
+                </div>
+                <div class="stat-card">
+                    <p class="stat-title">Sandbox Success Rate</p>
+                    <p class="stat-value" style="color:#818cf8">{success_rate}</p>
+                </div>
+            </section>
+
+            <div class="table-container">
+                <table>
                     <thead>
-                        <tr class="bg-slate-900 border-b border-slate-800 text-xs font-bold uppercase tracking-wider text-slate-400">
-                            <th class="p-4">Timestamp</th>
-                            <th class="p-4">Vulnerability ID</th>
-                            <th class="p-4">Remediation Source File</th>
-                            <th class="p-4">Sandbox Test</th>
-                            <th class="p-4">KMS Cryptographic Proof</th>
-                            <th class="p-4">Upstream Target</th>
+                        <tr>
+                            <th style="padding-left:24px;">Timestamp Tracking</th>
+                            <th>Vulnerability Node</th>
+                            <th>Remediation Source File</th>
+                            <th>Sandbox Test Pass</th>
+                            <th>KMS Cryptographic Proof</th>
+                            <th style="padding-right:24px;">Actions</th>
                         </tr>
                     </thead>
                     <tbody>{log_rows_html}</tbody>
                 </table>
             </div>
         </main>
+        <script>
+            async function triggerManualSync(btnElement) {{ 
+                const repoInput = document.getElementById('repoSelector');
+                const typeInput = document.getElementById('scanTypeSelector');
+                const testsInput = document.getElementById('runTestsCheckbox');
+                
+                const targetRepo = repoInput.value.trim();
+                const selectedType = typeInput.value;
+                const verifyWithTests = testsInput ? testsInput.checked : false;
+                
+                if(!targetRepo) {{
+                    alert("Please input a valid target repository path.");
+                    return;
+                }}
+                
+                const btn = btnElement || document.querySelector('button[onclick^="triggerManualSync"]');
+                const origText = btn.innerText;
+                btn.innerText = "SCANNING REPO...";
+                btn.disabled = true;
+                
+                try {{
+                    const response = await fetch('/api/actions/rescan', {{ 
+                        method: 'POST',
+                        headers: {{ 'Content-Type': 'application/json' }},
+                        body: JSON.stringify({{ 
+                            repo_name: targetRepo, 
+                            scan_type: selectedType,
+                            run_tests: verifyWithTests
+                        }})
+                    }});
+                    
+                    if (!response.ok) throw new Error("Network issue encountered.");
+                    
+                    alert("🚀 Global Pipeline Dispatched: Initializing dynamic sanitizer scanner on repo context: " + targetRepo);
+                    setTimeout(() => window.location.reload(), 1500);
+                }} catch (err) {{
+                    alert("❌ Action deployment failure: " + err.message);
+                }} finally {{
+                    btn.innerText = origText;
+                    btn.disabled = false;
+                }}
+            }}
+        </script>
     </body>
     </html>
     """

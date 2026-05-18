@@ -1,27 +1,26 @@
-version: '3.8'
-
 services:
-  veripatch-gateway:
+  veripatch-hub:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: veripatch_production_gateway
+    container_name: veripatch_orchestrator
     ports:
       - "8080:8080"
+    volumes:
+      - veripatch_db_data:/app/data
     environment:
       - PORT=8080
       - HOST=0.0.0.0
-      # OpenRouter & LLM configurations
+      # AWS Fargate will replace this with your actual RDS cluster link.
+      # For now, it defaults gracefully to fallback parameters.
+      - DATABASE_URL=${DATABASE_URL:-sqlite:////app/data/veripatch.db}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
-      - LLM_MODEL_NAME=openai/gpt-oss-120b:free
-      # Webhook validation secrets (override these in production deployment)
-      - SNYK_WEBHOOK_SECRET=${SNYK_WEBHOOK_SECRET:-secret_snyk_token}
-      - GITHUB_WEBHOOK_SECRET=${GITHUB_WEBHOOK_SECRET:-secret_github_token}
-      - TRIVY_AUTH_TOKEN=${TRIVY_AUTH_TOKEN:-secret_trivy_token}
-    volumes:
-      # Creates a shared workspace context volume for Git state manipulation tracking
-      - veripatch_workspace:/tmp/veripatch_workspace
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - GITHUB_OWNER=${GITHUB_OWNER}
+      - GITHUB_WEBHOOK_SECRET=${GITHUB_WEBHOOK_SECRET}
+      - TRIVY_AUTH_TOKEN=${TRIVY_AUTH_TOKEN}
     restart: unless-stopped
 
 volumes:
-  veripatch_workspace:
+  veripatch_db_data:
+    driver: local

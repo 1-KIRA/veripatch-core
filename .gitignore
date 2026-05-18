@@ -222,3 +222,6 @@ __marimo__/
 
 #Trivy
 trivy_report.json
+
+#test files
+test.py
