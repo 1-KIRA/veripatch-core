@@ -1,1 +1,1 @@
-# veripatch-core
+# veripatch-corec

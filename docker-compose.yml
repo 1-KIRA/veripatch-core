@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+  veripatch-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: veripatch_production_gateway
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - HOST=0.0.0.0
+      # OpenRouter & LLM configurations
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - LLM_MODEL_NAME=openai/gpt-oss-120b:free
+      # Webhook validation secrets (override these in production deployment)
+      - SNYK_WEBHOOK_SECRET=${SNYK_WEBHOOK_SECRET:-secret_snyk_token}
+      - GITHUB_WEBHOOK_SECRET=${GITHUB_WEBHOOK_SECRET:-secret_github_token}
+      - TRIVY_AUTH_TOKEN=${TRIVY_AUTH_TOKEN:-secret_trivy_token}
+    volumes:
+      # Creates a shared workspace context volume for Git state manipulation tracking
+      - veripatch_workspace:/tmp/veripatch_workspace
+    restart: unless-stopped
+
+volumes:
+  veripatch_workspace:
