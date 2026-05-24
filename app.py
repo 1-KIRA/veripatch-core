@@ -167,10 +167,14 @@ def run_async_remediation(repository_path: str, payload: dict, source_engine: st
                                 {"role": "user", "content": f"File: {rel_path}\n\nCode Context:\n{code_to_audit}"}
                             ]
                         }
-                        res = requests.post("https://openrouter.ai/api/v1/chat/completions", json=audit_payload, headers=headers, timeout=30)
+                        res = requests.post("https://openrouter.ai/api/v1/chat/completions", json=audit_payload, headers=headers, timeout=60)
                         res_json = res.json()
-                        
+
                         if "error" in res_json or "choices" not in res_json:
+                            err_msg = res_json.get("error", {})
+                            if isinstance(err_msg, dict):
+                                err_msg = err_msg.get("message", str(err_msg))
+                            print(f"⚠️ [API WARNING] OpenRouter model rejected query or returned error for {rel_path}: {err_msg} (HTTP {res.status_code})")
                             continue
                             
                         content_node = res_json["choices"][0]["message"].get("content")
