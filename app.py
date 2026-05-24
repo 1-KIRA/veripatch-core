@@ -163,7 +163,7 @@ def run_async_remediation(repository_path: str, payload: dict, source_engine: st
                             
                         headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
                         audit_payload = {
-                            "model": os.getenv("SAST_SCAN_MODEL", "google/gemma-4-31b-it:free"),
+                            "model": os.getenv("SAST_SCAN_MODEL", "nvidia/nemotron-3-super-120b-a12b:free"),
                             "messages": [
                                 {"role": "system", "content": system_scan_prompt},
                                 {"role": "user", "content": f"File: {rel_path}\n\nCode Context:\n{code_to_audit}"}
@@ -206,7 +206,9 @@ def run_async_remediation(repository_path: str, payload: dict, source_engine: st
                             })
                     except Exception as parse_err:
                         print(f"⚠️ [AUDIT WARNING] Skipped file processing tracking anomaly on {rel_path}: {parse_err}")
-                        
+
+                    time.sleep(3)  # avoid hitting free-tier rate limits between files
+
         source_engine = "processed_sast"
 
     if source_engine == "trivy":
@@ -269,10 +271,10 @@ def run_async_remediation(repository_path: str, payload: dict, source_engine: st
                 original_file_content = f.read()
 
             model_fallback_queue = [
-                "google/gemma-4-31b-it:free",
-                "deepseek/deepseek-v4-flash:free",
                 "nvidia/nemotron-3-super-120b-a12b:free",
-                "google/gemma-4-26b-a4b-it:free",
+                "poolside/laguna-m.1:free",
+                "openai/gpt-oss-120b:free",
+                "deepseek/deepseek-v4-flash:free",
             ]
             
             proposed_patch_raw = None
