@@ -1,5 +1,8 @@
 import os
+import sys
+import html
 import shutil
+import subprocess
 import time
 import csv
 import io
@@ -87,13 +90,20 @@ def run_async_remediation(repository_path: str, payload: dict, source_engine: st
         if os.path.exists(workspace_path):
             shutil.rmtree(workspace_path, ignore_errors=True)
         os.makedirs(os.path.dirname(workspace_path), exist_ok=True)
-        
-        if os.system(f'git clone "{master_clone_url}" "{workspace_path}"') != 0:
+
+        clone_result = subprocess.run(
+            ["git", "clone", master_clone_url, workspace_path],
+            capture_output=True,
+        )
+        if clone_result.returncode != 0:
             print("❌ [MANUAL SCAN ERROR] Secure clone engine rejected the target asset.")
             return
-            
+
         live_report_path = f"/tmp/trivy_live_{repo_name_clean}.json"
-        os.system(f'trivy fs "{workspace_path}" --format json --output "{live_report_path}" > /dev/null 2>&1')
+        subprocess.run(
+            ["trivy", "fs", workspace_path, "--format", "json", "--output", live_report_path],
+            capture_output=True,
+        )
         
         if os.path.exists(live_report_path):
             try:
@@ -113,17 +123,34 @@ def run_async_remediation(repository_path: str, payload: dict, source_engine: st
         if os.path.exists(workspace_path):
             shutil.rmtree(workspace_path, ignore_errors=True)
         os.makedirs(os.path.dirname(workspace_path), exist_ok=True)
-        
-        if os.system(f'git clone "{master_clone_url}" "{workspace_path}"') != 0:
+
+        clone_result = subprocess.run(
+            ["git", "clone", master_clone_url, workspace_path],
+            capture_output=True,
+        )
+        if clone_result.returncode != 0:
             print("❌ [SAST ERROR] Failed to acquire repository context for auditing.")
             return
             
         system_scan_prompt = (
-            "You are an automated static application security testing (SAST) engine. "
-            "Analyze the provided Python code for security vulnerabilities (e.g., CWE flaws, SQL injection, hardcoded secrets, RCE, insecure cryptography). "
-            "Return a raw JSON list of objects. Each object MUST contain keys exactly: 'id' (the vulnerability class string name), 'description' (clear explanation), 'start_line' (integer), 'end_line' (integer). "
-            "If no security flaws are found, return exactly an empty list: []. "
-            "Do not include markdown blocks, formatting, or any text other than raw JSON text array."
+            "You are an automated SAST (Static Application Security Testing) engine specializing in Python security analysis.\n\n"
+            "Analyze the provided source file for exploitable security vulnerabilities. Focus on:\n"
+            "- Injection flaws: SQL, OS command, LDAP, XPath injection (CWE-89, CWE-78)\n"
+            "- Hardcoded secrets, credentials, or API keys (CWE-798)\n"
+            "- Insecure cryptography: weak ciphers, MD5/SHA1 for passwords, use of `random` for secrets (CWE-327, CWE-330)\n"
+            "- Deserialization of untrusted data (CWE-502)\n"
+            "- Path traversal and arbitrary file inclusion (CWE-22)\n"
+            "- Remote code execution vectors: eval, exec, pickle (CWE-94)\n"
+            "- Missing or broken authentication/authorization (CWE-306, CWE-862)\n"
+            "- SSRF, open redirects, unvalidated redirects (CWE-918, CWE-601)\n"
+            "- Use of `shell=True` in subprocess calls with untrusted input (CWE-78)\n\n"
+            "RESPONSE FORMAT (strictly enforced):\n"
+            'Return ONLY a raw JSON array. Each element must have exactly these keys:\n'
+            '  {"id": "<CWE-ID or short vulnerability class>", "description": "<specific explanation with root cause and attack scenario>", "start_line": <integer>, "end_line": <integer>}\n\n'
+            "Rules:\n"
+            "- Report ONLY confirmed, exploitable findings — skip speculative or informational items\n"
+            "- If no vulnerabilities are found, return exactly: []\n"
+            "- Do NOT wrap output in markdown code blocks or add any text outside the JSON array"
         )
         
         for root, dirs, files in os.walk(workspace_path):
@@ -228,8 +255,11 @@ def run_async_remediation(repository_path: str, payload: dict, source_engine: st
         os.makedirs(os.path.dirname(workspace_path), exist_ok=True)
 
         try:
-            # 🛡️ FIX: Force the absolute loop iteration clone sequence to utilize the pristine built master_clone_url
-            if os.system(f'git clone "{master_clone_url}" "{workspace_path}"') != 0:
+            clone_result = subprocess.run(
+                ["git", "clone", master_clone_url, workspace_path],
+                capture_output=True,
+            )
+            if clone_result.returncode != 0:
                 raise RuntimeError("Failed to clone repository upstream target securely.")
 
             target_file_absolute = os.path.join(workspace_path, target_file)
@@ -248,18 +278,31 @@ def run_async_remediation(repository_path: str, payload: dict, source_engine: st
             
             if track_mode == "SAST":
                 system_prompt = (
-                    f"You are an expert Principal Security Architect. Refactor the code file {target_file} to fix the security flaw specified. "
-                    f"You must return the COMPLETE rewritten file text content from top to bottom with the vulnerability safely repaired. "
-                    f"Do not change or delete functional business logic strings. Return ONLY raw valid source code text lines. No markdown syntax wrapper block elements, prose, or explanations."
+                    f"You are an expert security engineer fixing a specific vulnerability in {target_file}.\n\n"
+                    "RULES:\n"
+                    "1. Return the COMPLETE rewritten file — never omit lines or use placeholders like '# ... rest of code'\n"
+                    "2. Fix ONLY the reported vulnerability — do not alter unrelated logic, rename variables, or add features\n"
+                    "3. Preserve all function signatures, class structures, and imports unrelated to the fix\n"
+                    "4. If a new import is required, add it alongside existing imports at the top of the file\n"
+                    "5. Output ONLY raw source code — no markdown fences, no explanations, no inline comments about the change"
                 )
                 user_prompt = (
-                    f"Original Application Code:\n{original_file_content}\n\n"
-                    f"Security Error Instruction: {ai_instruction}\n"
-                    f"Flaw Coordinates: Lines {task.get('start_line')} through {task.get('end_line')}."
+                    f"Vulnerability to fix: {ai_instruction}\n"
+                    f"Affected lines: {task.get('start_line')} to {task.get('end_line')}\n\n"
+                    f"--- CURRENT FILE ---\n{original_file_content}\n--- END FILE ---"
                 )
             else:
-                system_prompt = f"You are an automated security patch agent. Return ONLY the raw file string text contents for a fixed version of {target_file}. Do not include markdown code blocks, explanations, or prose."
-                user_prompt = f"Original File Context:\n{original_file_content}\n\nInstruction:\n{ai_instruction}"
+                system_prompt = (
+                    f"You are an automated dependency security patch agent fixing {target_file}.\n\n"
+                    "RULES:\n"
+                    "1. Return the COMPLETE updated file — never omit lines or use placeholders\n"
+                    "2. Apply ONLY the version change described — do not alter anything else\n"
+                    "3. Output ONLY raw file content — no markdown fences, no explanations"
+                )
+                user_prompt = (
+                    f"Instruction: {ai_instruction}\n\n"
+                    f"--- CURRENT FILE ---\n{original_file_content}\n--- END FILE ---"
+                )
             
             for current_model in model_fallback_queue:
                 print(f"🔮 [LLM CALL] Attempting generation with model: '{current_model}'...")
@@ -301,10 +344,12 @@ def run_async_remediation(repository_path: str, payload: dict, source_engine: st
                     tmp_f.write(validation_result["patched_code"])
                 
                 print("🏁 [SANDBOX TESTING] Executing 'pytest' across workspace files...")
-                # Run pytest inside the custom directory context; suppress output clutter but track exit status code
-                test_status = os.system(f'cd "{workspace_path}" && python -m pytest > /dev/null 2>&1')
-                
-                if test_status != 0:
+                test_result = subprocess.run(
+                    [sys.executable, "-m", "pytest"],
+                    cwd=workspace_path,
+                    capture_output=True,
+                )
+                if test_result.returncode != 0:
                     print(f"❌ [SANDBOX TESTING REJECTION] Patch introduced a functional regression. Pytest suite failed.")
                     db_logger.log_remediation_event(
                         cve_id, target_file, "FAILED", "REGRESSION_TEST_FAILURE", "UNSIGNED", "REJECTED_BY_TEST_SUITE", "Pytest suite failed on regression check."
@@ -318,12 +363,20 @@ def run_async_remediation(repository_path: str, payload: dict, source_engine: st
 
             print(f"🚀 [GIT PUBLISH] Committing secure patches upstream...")
             branch_name = f"veripatch/remediation-{cve_safe_dir}"
-            
-            os.system(f'cd "{workspace_path}" && git config user.name "VeriPatch Agent" && git config user.email "agent@veripatch.internal"')
-            os.system(f'cd "{workspace_path}" && git checkout -b {branch_name} > /dev/null 2>&1')
-            os.system(f'cd "{workspace_path}" && git add "{target_file}" && git commit -m "🤖 [Security Patch] Resolved {track_mode} vulnerability {cve_id}" > /dev/null 2>&1')
-            
-            if os.system(f'cd "{workspace_path}" && git push origin {branch_name} --force > /dev/null 2>&1') != 0:
+
+            subprocess.run(["git", "config", "user.name", "VeriPatch Agent"], cwd=workspace_path, check=True)
+            subprocess.run(["git", "config", "user.email", "agent@veripatch.internal"], cwd=workspace_path, check=True)
+            subprocess.run(["git", "checkout", "-b", branch_name], cwd=workspace_path, check=True, capture_output=True)
+            subprocess.run(["git", "add", target_file], cwd=workspace_path, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", f"🤖 [Security Patch] Resolved {track_mode} vulnerability {cve_id}"],
+                cwd=workspace_path, check=True, capture_output=True,
+            )
+            push_result = subprocess.run(
+                ["git", "push", "origin", branch_name, "--force"],
+                cwd=workspace_path, capture_output=True,
+            )
+            if push_result.returncode != 0:
                 raise RuntimeError("Failed to push remediation branch upstream to GitHub.")
             
             print(f"🔗 [GITHUB API] Opening live Pull Request for branch '{branch_name}'...")
@@ -377,8 +430,13 @@ def run_async_remediation(repository_path: str, payload: dict, source_engine: st
 
 @app.post("/webhooks/v1/trivy")
 async def handle_trivy_webhook(request: Request, background_tasks: BackgroundTasks):
-    auth_header = request.headers.get("Authorization")
-    if not auth_header or auth_header.split(" ")[1] != TRIVY_AUTH_TOKEN: raise HTTPException(status_code=401)
+    if not TRIVY_AUTH_TOKEN:
+        raise HTTPException(status_code=500, detail="TRIVY_AUTH_TOKEN not configured.")
+    auth_header = request.headers.get("Authorization", "")
+    parts = auth_header.split(" ", 1)
+    provided_token = parts[1] if len(parts) == 2 else ""
+    if not hmac.compare_digest(provided_token, TRIVY_AUTH_TOKEN):
+        raise HTTPException(status_code=401, detail="Invalid Trivy auth token.")
     payload = await request.json()
     raw_artifact = payload.get("ArtifactName", "").strip()
     background_tasks.add_task(run_async_remediation, repository_path=raw_artifact, payload=payload, source_engine="trivy")
@@ -487,28 +545,38 @@ async def serve_dashboard():
             status_badge = '<span class="badge badge-success">● Compile Passed</span>'
         else:
             status_badge = '<span class="badge badge-fail">○ Review Required</span>'
-        
-        pr_url = item["pr_url"].strip()
-        if "]" in pr_url or "(" in pr_url:
-            pr_url = re.sub(r'\[.*?\]\(.*?\)', '', pr_url)
-            for char in ['[', ']', '(', ')']:
-                pr_url = pr_url.replace(char, '')
-        
-        if pr_url in ["LOCAL_SIMULATION_MODE", "REJECTED_BY_SANDBOX", "ERROR_CRASH"]:
-            link_element = f'<span class="txt-disabled">{pr_url.replace("_", " ")}</span>'
+
+        # Escape all DB values before inserting into HTML to prevent stored XSS
+        ts = html.escape(str(item.get("timestamp", ""))[:19])
+        cve_tag = html.escape(str(item.get("cve_id", "")))
+        target_file_display = html.escape(str(item.get("target_file", "")))
+        sig = str(item.get("kms_signature", ""))
+        sig_title = html.escape(sig)
+        sig_preview = html.escape(sig[:24])
+
+        pr_url_raw = str(item.get("pr_url", "")).strip()
+        # Strip any residual markdown link syntax from stored values
+        pr_url_raw = re.sub(r'\[.*?\]\(.*?\)', '', pr_url_raw)
+        for char in ["[", "]", "(", ")"]:
+            pr_url_raw = pr_url_raw.replace(char, "")
+
+        NON_LINK_STATUSES = {"LOCAL_SIMULATION_MODE", "REJECTED_BY_SANDBOX", "ERROR_CRASH", "REJECTED_BY_TEST_SUITE"}
+        if pr_url_raw in NON_LINK_STATUSES:
+            link_element = f'<span class="txt-disabled">{html.escape(pr_url_raw.replace("_", " "))}</span>'
         else:
-            link_element = f'<a href="{pr_url}" target="_blank" class="btn-action">Review PR ↗</a>'
-            
-        log_rows_html += f"""
-        <tr>
-            <td class="font-mono text-muted">{item["timestamp"][:19]}</td>
-            <td><span class="cve-tag">{item["cve_id"]}</span></td>
-            <td class="font-mono text-light">{item["target_file"]}</td>
-            <td>{status_badge}</td>
-            <td class="font-mono text-amber" title="{item["kms_signature"]}">{item["kms_signature"][:24]}...</td>
-            <td>{link_element}</td>
-        </tr>
-        """
+            safe_url = html.escape(pr_url_raw)
+            link_element = f'<a href="{safe_url}" target="_blank" rel="noopener noreferrer" class="btn-action">Review PR ↗</a>'
+
+        log_rows_html += (
+            f"<tr>"
+            f'<td class="font-mono text-muted">{ts}</td>'
+            f'<td><span class="cve-tag">{cve_tag}</span></td>'
+            f'<td class="font-mono text-light">{target_file_display}</td>'
+            f"<td>{status_badge}</td>"
+            f'<td class="font-mono text-amber" title="{sig_title}">{sig_preview}...</td>'
+            f"<td>{link_element}</td>"
+            f"</tr>\n"
+        )
     if not log_rows_html:
         log_rows_html = '<tr><td colspan="6" class="no-data">No telemetry logs found matching recent execution cycles.</td></tr>'
 

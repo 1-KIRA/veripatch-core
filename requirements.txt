@@ -5,3 +5,6 @@ requests
 anyio
 pytest
 psycopg2-binary
+langgraph
+langchain-core
+openai
