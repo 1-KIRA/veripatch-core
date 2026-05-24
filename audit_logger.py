@@ -55,7 +55,9 @@ class EnterpriseAuditLogger:
                         """)
                 print("🐘 [DB INIT] PostgreSQL connection verified.")
             else:
-                os.makedirs(os.path.dirname(self.sqlite_path), exist_ok=True)
+                db_dir = os.path.dirname(self.sqlite_path)
+                if db_dir:
+                    os.makedirs(db_dir, exist_ok=True)
                 with self._get_connection() as conn:
                     conn.execute("""
                         CREATE TABLE IF NOT EXISTS logs (

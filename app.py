@@ -161,7 +161,7 @@ def run_async_remediation(repository_path: str, payload: dict, source_engine: st
                             
                         headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
                         audit_payload = {
-                            "model": "deepseek/deepseek-v4-flash:free",
+                            "model": os.getenv("SAST_SCAN_MODEL", "google/gemini-flash-1.5-8b:free"),
                             "messages": [
                                 {"role": "system", "content": system_scan_prompt},
                                 {"role": "user", "content": f"File: {rel_path}\n\nCode Context:\n{code_to_audit}"}
