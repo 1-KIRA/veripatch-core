@@ -34,16 +34,12 @@ class RescanPayload(BaseModel):
     run_tests: bool = False  # Added to toggle pytest execution dynamically
 
 def pure_sanitize_string(input_str: str) -> str:
-    """
-    🛡️ ABSOLUTE SANITIZER: Eradicates markdown URLs, structural brackets, 
-    parentheses, and recursive protocol elements completely.
-    """
     s = str(input_str).strip()
-    # Remove markdown link formatting patterns [text](link)
     s = re.sub(r'\[.*?\]\(.*?\)', '', s)
-    # Remove structural syntax leaks
     for artifact in ['[', ']', '(', ')', '.git', 'https://', 'http://', 'git@', 'github.com']:
         s = s.replace(artifact, '')
+    # Collapse any repeated slashes introduced by an empty owner segment
+    s = re.sub(r'/+', '/', s)
     return s.strip(':/ ')
 
 def extract_owner_and_repo(input_string: str) -> tuple[str, str]:
@@ -539,6 +535,12 @@ async def serve_dashboard():
     failed_scans = total_scans - passed_scans
     success_rate = f"{(passed_scans / total_scans * 100):.1f}%" if total_scans > 0 else "100.0%"
 
+    default_repo_value = (
+        f"https://github.com/{GITHUB_OWNER}/your-repo"
+        if GITHUB_OWNER
+        else "owner/your-repo"
+    )
+
     log_rows_html = ""
     for item in logs:
         if item["sandbox_status"] == "PASSED":
@@ -657,7 +659,7 @@ async def serve_dashboard():
                     <label style="color: #94a3b8; font-size: 11px; font-weight: 700; display: flex; align-items: center; gap: 4px; padding-left: 8px; cursor: pointer;">
                         <input type="checkbox" id="runTestsCheckbox" style="width: auto; margin: 0;"> Run Tests (pytest)
                     </label>
-                    <input type="text" id="repoSelector" value="https://github.com/{GITHUB_OWNER}/Incident_Detection_Tool" placeholder="Pasted Repository URL or owner/repo">
+                    <input type="text" id="repoSelector" value="{default_repo_value}" placeholder="https://github.com/owner/repo  or  owner/repo">
                     <button onclick="triggerManualSync(this)">Force Run Scan</button>
                 </div>
             </header>
