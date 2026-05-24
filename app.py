@@ -163,7 +163,7 @@ def run_async_remediation(repository_path: str, payload: dict, source_engine: st
                             
                         headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
                         audit_payload = {
-                            "model": os.getenv("SAST_SCAN_MODEL", "meta-llama/llama-3.1-8b-instruct:free"),
+                            "model": os.getenv("SAST_SCAN_MODEL", "google/gemma-4-31b-it:free"),
                             "messages": [
                                 {"role": "system", "content": system_scan_prompt},
                                 {"role": "user", "content": f"File: {rel_path}\n\nCode Context:\n{code_to_audit}"}
@@ -269,10 +269,10 @@ def run_async_remediation(repository_path: str, payload: dict, source_engine: st
                 original_file_content = f.read()
 
             model_fallback_queue = [
+                "google/gemma-4-31b-it:free",
                 "deepseek/deepseek-v4-flash:free",
-                "openai/gpt-oss-120b:free",
-                "z-ai/glm-4.5-air:free",
-                "minimax/minimax-m2.5:free"
+                "nvidia/nemotron-3-super-120b-a12b:free",
+                "google/gemma-4-26b-a4b-it:free",
             ]
             
             proposed_patch_raw = None
