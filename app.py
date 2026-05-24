@@ -3,6 +3,8 @@ import sys
 import html
 import shutil
 import subprocess
+from dotenv import load_dotenv
+load_dotenv()
 import time
 import csv
 import io
@@ -161,7 +163,7 @@ def run_async_remediation(repository_path: str, payload: dict, source_engine: st
                             
                         headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
                         audit_payload = {
-                            "model": os.getenv("SAST_SCAN_MODEL", "google/gemini-flash-1.5-8b:free"),
+                            "model": os.getenv("SAST_SCAN_MODEL", "meta-llama/llama-3.1-8b-instruct:free"),
                             "messages": [
                                 {"role": "system", "content": system_scan_prompt},
                                 {"role": "user", "content": f"File: {rel_path}\n\nCode Context:\n{code_to_audit}"}
